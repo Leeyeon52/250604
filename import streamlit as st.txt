@@ -1,0 +1,71 @@
+import streamlit as st
+from streamlit_chat import message
+import pandas as pd
+from sentence_transformers import SentenceTransformer
+import numpy as np
+from pathlib import Path
+
+# 모델 로딩
+@st.cache_resource
+def load_model():
+    return SentenceTransformer('jhgan/ko-sroberta-multitask')
+
+# 데이터셋 로딩
+@st.cache_data
+def load_dataset():
+    dataset_path = Path(r'D:\학습\250528\wellness_dataset.csv')
+    if not dataset_path.exists():
+        st.error(f"❌ 데이터셋 경로가 올바르지 않습니다: {dataset_path}")
+        st.stop()
+    df = pd.read_csv(dataset_path)
+    df = df[['사람문장1', '시스템문장1']].dropna().reset_index(drop=True)
+    return df
+
+# 문장 임베딩 생성
+@st.cache_data
+def embed_corpus(sentences, model):
+    return np.array([model.encode(sentence) for sentence in sentences])
+
+# 가장 유사한 응답 찾기
+def find_best_answer(user_input, model, corpus_sentences, corpus_embeddings):
+    user_embedding = model.encode(user_input)
+    similarities = np.dot(corpus_embeddings, user_embedding) / (
+        np.linalg.norm(corpus_embeddings, axis=1) * np.linalg.norm(user_embedding)
+    )
+    best_idx = int(np.argmax(similarities))
+    return corpus_sentences[best_idx], best_idx
+
+# 모델 및 데이터 준비
+model = load_model()
+df = load_dataset()
+corpus_sentences = df['사람문장1'].tolist()
+corpus_embeddings = embed_corpus(corpus_sentences, model)
+
+# Streamlit UI 설정
+st.set_page_config(page_title="심리상담 챗봇", page_icon="🧠")
+st.title("🧠 심리상담 챗봇")
+st.markdown("이곳에 당신의 고민을 이야기해 보세요.")
+
+# 세션 상태 초기화
+if 'generated' not in st.session_state:
+    st.session_state['generated'] = []
+if 'past' not in st.session_state:
+    st.session_state['past'] = []
+
+# 입력 폼
+with st.form('chat_form', clear_on_submit=True):
+    user_input = st.text_input("💬 당신:", "")
+    submitted = st.form_submit_button("전송")
+
+# 응답 처리
+if submitted and user_input:
+    _, best_idx = find_best_answer(user_input, model, corpus_sentences, corpus_embeddings)
+    response = df.loc[best_idx, '시스템문장1']
+
+    st.session_state.past.append(user_input)
+    st.session_state.generated.append(response)
+
+# 대화 내용 출력
+for i in range(len(st.session_state.past)):
+    message(st.session_state.past[i], is_user=True, key=f"user_{i}")
+    message(st.session_state.generated[i], key=f"bot_{i}")
