@@ -1,0 +1,149 @@
+from flask import Flask, render_template, request
+from catboost import CatBoostRegressor, Pool
+import pandas as pd
+import pymysql
+from datetime import datetime
+import re
+
+app = Flask(__name__)
+
+# 모델 로딩
+model = CatBoostRegressor()
+model.load_model('catboost_model.cbm')
+
+# 지역 이름 로딩
+area_names = pd.read_csv(
+    'tn_visit_area_info.csv',
+    encoding='utf-8',
+    on_bad_lines='skip'
+)['VISIT_AREA_NM'].drop_duplicates().tolist()
+
+# DB 설정
+db_config = {
+    'host': 'localhost',
+    'user': 'root',
+    'password': '4907',
+    'database': 'travel_bot',
+    'charset': 'utf8mb4'
+}
+
+def save_user_query(query_text):
+    try:
+        conn = pymysql.connect(**db_config)
+        with conn.cursor() as cursor:
+            sql = "INSERT INTO user_queries (query_text, created_at) VALUES (%s, %s)"
+            cursor.execute(sql, (query_text, datetime.now()))
+            user_query_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+        return user_query_id
+    except Exception as e:
+        print(f"DB 저장 오류: {e}")
+        return None
+
+def save_recommendations(user_query_id, recommendations):
+    try:
+        conn = pymysql.connect(**db_config)
+        with conn.cursor() as cursor:
+            sql = """
+                INSERT INTO recommendations
+                (user_query_id, area, score, star, created_at)
+                VALUES (%s, %s, %s, %s, %s)
+            """
+            now = datetime.now()
+            for rec in recommendations:
+                cursor.execute(sql, (
+                    user_query_id,
+                    rec['area'],
+                    rec['score'],
+                    rec['star'],
+                    now
+                ))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"추천 저장 오류: {e}")
+
+def score_to_star(score):
+    return max(1, min(5, int(round(score))))
+
+def parse_input_text(text):
+    data = {
+        'GENDER': None,
+        'AGE_GRP': 30,
+        'VISIT_AREA_NM': None,
+        'TRAVEL_MISSION_INT': 50,
+        'TRAVEL_COMPANIONS_NUM': 0,
+        'TRAVEL_MOTIVE_1': 1,
+    }
+    for i in range(1, 9):
+        data[f'TRAVEL_STYL_{i}'] = 0
+
+    text = text.lower()
+
+    if '남' in text:
+        data['GENDER'] = 0
+    elif '여' in text:
+        data['GENDER'] = 1
+
+    age_search = re.search(r'(\d{1,3})\s*(살|세)?', text)
+    if age_search:
+        age = int(age_search.group(1))
+        if 10 <= age <= 100:
+            data['AGE_GRP'] = age
+
+    for area in area_names:
+        if area.lower() in text:
+            data['VISIT_AREA_NM'] = area
+            break
+
+    if '휴식' in text:
+        data['TRAVEL_STYL_1'] = 1
+    if '관광' in text:
+        data['TRAVEL_STYL_2'] = 1
+    if '쇼핑' in text:
+        data['TRAVEL_STYL_3'] = 1
+
+    if data['GENDER'] is None:
+        data['GENDER'] = 0
+    if data['VISIT_AREA_NM'] is None:
+        data['VISIT_AREA_NM'] = area_names[0]
+
+    return data
+
+@app.route('/', methods=['GET', 'POST'])
+def index():
+    recommendations = []
+    user_input = ""
+    if request.method == 'POST':
+        user_input = request.form['query']
+        user_query_id = save_user_query(user_input)
+        parsed_data = parse_input_text(user_input)
+
+        cat_features = [
+            'GENDER', 'VISIT_AREA_NM',
+            'TRAVEL_STYL_1', 'TRAVEL_STYL_2', 'TRAVEL_STYL_3', 'TRAVEL_STYL_4',
+            'TRAVEL_STYL_5', 'TRAVEL_STYL_6', 'TRAVEL_STYL_7', 'TRAVEL_STYL_8',
+            'TRAVEL_MOTIVE_1', 'TRAVEL_MISSION_INT'
+        ]
+
+        results = []
+        for area in area_names:
+            df_input = pd.DataFrame([{**parsed_data, 'VISIT_AREA_NM': area}])
+            pool = Pool(df_input, cat_features=cat_features)
+            score = model.predict(pool)[0]
+            results.append({
+                'area': area,
+                'score': score,
+                'star': score_to_star(score)
+            })
+
+        sorted_results = sorted(results, key=lambda x: x['score'], reverse=True)
+        top_5 = sorted_results[:5]
+
+        if user_query_id:
+            save_recommendations(user_query_id, top_5)
+
+        recommendations = top_5
+
+    return render_template('index.html', user_input=user_input, recommendations=recommendations)
